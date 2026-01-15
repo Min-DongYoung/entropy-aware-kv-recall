@@ -1,0 +1,22 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Experiment Data & Logs (Do NOT commit results)
+results/
+logs/
+data/
+*.json
+*.jsonl
+*.csv
+*.png
+*.pt
+*.pth
+
+# Colab / Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# HuggingFace cache
+.cache/

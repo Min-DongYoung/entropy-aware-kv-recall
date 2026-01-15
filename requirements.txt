@@ -1,0 +1,26 @@
+# Core ML Libraries
+torch>=2.1.2
+torchvision
+torchaudio
+
+# Hugging Face Ecosystem
+transformers>=4.37.0
+accelerate>=0.26.0
+datasets>=2.16.0
+huggingface_hub
+
+# Optimization
+flash-attn>=2.5.0
+einops
+
+# Data Analysis & Visualization
+numpy
+pandas
+scipy
+matplotlib
+seaborn
+
+# Utilities
+tqdm
+jupyter
+ipykernel
