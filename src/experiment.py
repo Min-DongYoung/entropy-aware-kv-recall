@@ -1,8 +1,9 @@
+%%writefile src/experiment.py
 import argparse
-import inspect
 import json
 import os
 import random
+import inspect
 from datetime import datetime
 
 import torch
@@ -47,9 +48,11 @@ def build_prompt(example: dict) -> str:
 
 def extract_layerwise_attention(outputs) -> torch.Tensor:
     if outputs.attentions is None:
+        # Flash Attention 2 등 일부 구현체는 output_attentions=True를 지원하지 않음
         raise RuntimeError(
-            "Model did not return attention weights. Ensure output_attentions=True "
-            "and that the model supports attention outputs with flash_attention_2."
+            "Model did not return attention weights. "
+            "Please ensure `attn_implementation='eager'` is used, "
+            "as Flash Attention does not support returning attention weights."
         )
     per_layer = []
     for layer_attn in outputs.attentions:
@@ -59,6 +62,8 @@ def extract_layerwise_attention(outputs) -> torch.Tensor:
             raise RuntimeError(
                 f"Unexpected attention tensor rank={layer_attn.dim()} (expected 4)."
             )
+        # [Batch, Heads, Q_len, KV_len] -> [Batch, KV_len] (Sum over heads)
+        # Q_len is assumed to be 1 (incremental decoding)
         collapsed = layer_attn[0].sum(dim=0)
         if collapsed.size(0) != 1:
             raise RuntimeError(
@@ -133,7 +138,6 @@ def forward_step(model, input_ids, attention_mask, past_key_values):
 def get_flash_attn_version() -> str:
     try:
         import flash_attn
-
         return flash_attn.__version__
     except Exception:
         return "unknown"
@@ -167,11 +171,12 @@ def main() -> None:
         args.model_path,
         torch_dtype=torch.bfloat16,
         device_map="cuda",
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",  # [중요] Flash Attention 2 -> Eager 모드로 변경
         trust_remote_code=True,
     )
     model.eval()
 
+    # 데이터셋 로딩 (견고성 강화)
     load_dataset_kwargs = {}
     if "trust_remote_code" in inspect.signature(load_dataset).parameters:
         load_dataset_kwargs["trust_remote_code"] = True
@@ -186,10 +191,10 @@ def main() -> None:
     except RuntimeError as exc:
         if "Dataset scripts are no longer supported" in str(exc):
             raise RuntimeError(
-                "Failed to load `THUDM/LongBench` because the installed `datasets` version does not support "
-                "script-based datasets. Install a 2.x version (e.g. `pip install -r requirements.txt -U`)."
+                "Failed to load `THUDM/LongBench`. Please verify `datasets` version (e.g. 2.19.0)."
             ) from exc
         raise
+
     num_layers = int(getattr(model.config, "num_hidden_layers", 0) or 0)
     if num_layers <= 0:
         try:
@@ -204,7 +209,7 @@ def main() -> None:
         "dataset_name": args.dataset_name,
         "dataset_split": args.dataset_split,
         "max_seq_len": args.max_seq_len,
-        "attn_implementation": "flash_attention_2",
+        "attn_implementation": "eager",  # 메타데이터 업데이트
         "flash_attn_version": get_flash_attn_version(),
         "window_size": args.window_size,
         "num_layers": num_layers,
@@ -244,6 +249,7 @@ def main() -> None:
             past_key_values = None
 
             with torch.no_grad():
+                # [Prefill 단계]
                 for idx in range(seq_len - 1):
                     token = input_ids[:, idx : idx + 1]
                     current_mask = attention_mask[:, : idx + 1]
@@ -257,6 +263,7 @@ def main() -> None:
                 current_token = input_ids[:, seq_len - 1 : seq_len]
                 current_mask = attention_mask[:, :seq_len]
 
+                # [Generation 단계]
                 for step in range(max_new_tokens):
                     outputs, attn_per_layer = forward_step(
                         model, current_token, current_mask, past_key_values
