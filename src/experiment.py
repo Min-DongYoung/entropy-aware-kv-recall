@@ -1,9 +1,7 @@
 import argparse
 import json
-import math
 import os
 import random
-import time
 from datetime import datetime
 
 import torch
@@ -46,60 +44,79 @@ def build_prompt(example: dict) -> str:
     return str(example)
 
 
-def extract_last_layer_attention(outputs) -> torch.Tensor:
+def extract_layerwise_attention(outputs) -> torch.Tensor:
     if outputs.attentions is None:
         raise RuntimeError(
             "Model did not return attention weights. Ensure output_attentions=True "
             "and that the model supports attention outputs with flash_attention_2."
         )
-    last_layer = outputs.attentions[-1]
-    attn = last_layer[0].mean(dim=0).squeeze(0)
-    return attn.float()
+    per_layer = []
+    for layer_attn in outputs.attentions:
+        if layer_attn is None:
+            raise RuntimeError("Encountered None attention tensor in outputs.attentions.")
+        if layer_attn.dim() != 4:
+            raise RuntimeError(
+                f"Unexpected attention tensor rank={layer_attn.dim()} (expected 4)."
+            )
+        collapsed = layer_attn[0].sum(dim=0)
+        if collapsed.size(0) != 1:
+            raise RuntimeError(
+                f"Expected q_len=1 for incremental decoding, got q_len={collapsed.size(0)}."
+            )
+        per_layer.append(collapsed.squeeze(0).to(dtype=torch.float32))
+    return torch.stack(per_layer, dim=0)
 
 
 def compute_recalls(
-    attn_vec: torch.Tensor,
-    accum_scores: torch.Tensor,
+    attn_per_layer: torch.Tensor,
+    accum_scores_per_layer: torch.Tensor,
     valid_mask: torch.Tensor,
     budget_ratios: tuple,
     window_size: int,
 ) -> dict:
-    valid_count = int(valid_mask.sum().item())
+    valid_positions = torch.nonzero(valid_mask, as_tuple=False).flatten()
+    valid_count = int(valid_positions.numel())
     recalls = {}
     if valid_count == 0:
         for ratio in budget_ratios:
             recalls[ratio] = 0.0
         return recalls
 
-    scores_gold = attn_vec.clone()
-    scores_pred = accum_scores[: attn_vec.size(0)].clone()
-    scores_gold[~valid_mask] = -float("inf")
-    scores_pred[~valid_mask] = -float("inf")
-
+    num_layers = int(attn_per_layer.size(0))
     for ratio in budget_ratios:
         k = max(1, int(ratio * valid_count))
         k = min(k, valid_count)
-        gold_idx = torch.topk(scores_gold, k, dim=-1).indices
+        layer_recalls = []
         cutoff_idx = max(0, valid_count - window_size)
-        window_indices = torch.arange(cutoff_idx, valid_count, device=attn_vec.device)
-        remaining_k = k - int(window_indices.numel())
+        window_positions = valid_positions[cutoff_idx:]
+        history_positions = valid_positions[:cutoff_idx]
 
-        if remaining_k > 0:
-            hist_scores = scores_pred[:cutoff_idx]
-            if hist_scores.numel() > 0:
-                hh_indices = torch.topk(hist_scores, remaining_k, dim=-1).indices
-                pred_idx = torch.cat([hh_indices, window_indices], dim=0)
+        for layer_idx in range(num_layers):
+            scores_gold_valid = attn_per_layer[layer_idx].index_select(0, valid_positions)
+            gold_rel = torch.topk(scores_gold_valid, k, dim=-1).indices
+            gold_pos = valid_positions.index_select(0, gold_rel)
+
+            remaining_k = k - int(window_positions.numel())
+            if remaining_k > 0:
+                hist_scores = accum_scores_per_layer[layer_idx].index_select(
+                    0, history_positions
+                )
+                hh_rel = torch.topk(hist_scores, remaining_k, dim=-1).indices
+                hh_pos = history_positions.index_select(0, hh_rel)
+                pred_pos = torch.cat([hh_pos, window_positions], dim=0)
             else:
-                pred_idx = window_indices
-        else:
-            pred_idx = window_indices[-k:]
-        hits = torch.isin(pred_idx, gold_idx).sum().item()
-        recalls[ratio] = hits / k
+                pred_pos = window_positions[-k:]
+
+            hits = torch.isin(pred_pos, gold_pos).sum().to(dtype=torch.float32)
+            layer_recalls.append(hits / float(k))
+
+        recalls[ratio] = float(torch.stack(layer_recalls).mean().item())
     return recalls
 
 
 def forward_step(model, input_ids, attention_mask, past_key_values):
-    position_ids = attention_mask.cumsum(-1)[:, -1:]
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids = position_ids.clamp_min(0)[:, -1:]
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -108,8 +125,8 @@ def forward_step(model, input_ids, attention_mask, past_key_values):
         use_cache=True,
         output_attentions=True,
     )
-    attn_vec = extract_last_layer_attention(outputs)
-    return outputs, attn_vec
+    attn_per_layer = extract_layerwise_attention(outputs)
+    return outputs, attn_per_layer
 
 
 def get_flash_attn_version() -> str:
@@ -155,6 +172,12 @@ def main() -> None:
     model.eval()
 
     dataset = load_dataset("THUDM/LongBench", args.dataset_name, split=args.dataset_split)
+    num_layers = int(getattr(model.config, "num_hidden_layers", 0) or 0)
+    if num_layers <= 0:
+        try:
+            num_layers = int(len(model.model.layers))
+        except Exception as exc:
+            raise RuntimeError("Unable to infer the number of transformer layers.") from exc
 
     meta = {
         "type": "meta",
@@ -166,6 +189,7 @@ def main() -> None:
         "attn_implementation": "flash_attention_2",
         "flash_attn_version": get_flash_attn_version(),
         "window_size": args.window_size,
+        "num_layers": num_layers,
     }
 
     device = torch.device("cuda")
@@ -196,33 +220,35 @@ def main() -> None:
             if max_new_tokens <= 0:
                 continue
 
-            accum_scores = torch.zeros(args.max_seq_len, device=device, dtype=torch.float32)
+            accum_scores = torch.zeros(
+                (num_layers, args.max_seq_len), device=device, dtype=torch.float32
+            )
             past_key_values = None
 
             with torch.no_grad():
                 for idx in range(seq_len - 1):
                     token = input_ids[:, idx : idx + 1]
                     current_mask = attention_mask[:, : idx + 1]
-                    outputs, attn_vec = forward_step(
+                    outputs, attn_per_layer = forward_step(
                         model, token, current_mask, past_key_values
                     )
-                    kv_len = attn_vec.size(0)
-                    accum_scores[:kv_len] += attn_vec
+                    kv_len = int(attn_per_layer.size(1))
+                    accum_scores[:, :kv_len] += attn_per_layer
                     past_key_values = outputs.past_key_values
 
                 current_token = input_ids[:, seq_len - 1 : seq_len]
                 current_mask = attention_mask[:, :seq_len]
 
                 for step in range(max_new_tokens):
-                    outputs, attn_vec = forward_step(
+                    outputs, attn_per_layer = forward_step(
                         model, current_token, current_mask, past_key_values
                     )
                     logits = outputs.logits[:, -1, :]
                     entropy = compute_entropy(logits)
-                    kv_len = attn_vec.size(0)
+                    kv_len = int(attn_per_layer.size(1))
                     valid_mask = current_mask[0, :kv_len].bool()
                     recalls = compute_recalls(
-                        attn_vec,
+                        attn_per_layer,
                         accum_scores,
                         valid_mask,
                         BUDGET_RATIOS,
@@ -242,7 +268,7 @@ def main() -> None:
                     if step % args.log_every == 0:
                         log_file.flush()
 
-                    accum_scores[:kv_len] += attn_vec
+                    accum_scores[:, :kv_len] += attn_per_layer
                     past_key_values = outputs.past_key_values
                     next_token = torch.argmax(logits, dim=-1, keepdim=True)
                     if stop_on_eos and eos_token_id is not None:
