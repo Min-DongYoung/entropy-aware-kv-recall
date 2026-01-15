@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import os
 import random
@@ -171,7 +172,24 @@ def main() -> None:
     )
     model.eval()
 
-    dataset = load_dataset("THUDM/LongBench", args.dataset_name, split=args.dataset_split)
+    load_dataset_kwargs = {}
+    if "trust_remote_code" in inspect.signature(load_dataset).parameters:
+        load_dataset_kwargs["trust_remote_code"] = True
+
+    try:
+        dataset = load_dataset(
+            "THUDM/LongBench",
+            args.dataset_name,
+            split=args.dataset_split,
+            **load_dataset_kwargs,
+        )
+    except RuntimeError as exc:
+        if "Dataset scripts are no longer supported" in str(exc):
+            raise RuntimeError(
+                "Failed to load `THUDM/LongBench` because the installed `datasets` version does not support "
+                "script-based datasets. Install a 2.x version (e.g. `pip install -r requirements.txt -U`)."
+            ) from exc
+        raise
     num_layers = int(getattr(model.config, "num_hidden_layers", 0) or 0)
     if num_layers <= 0:
         try:

@@ -20,3 +20,5 @@ data/
 
 # HuggingFace cache
 .cache/
+
+_external/
