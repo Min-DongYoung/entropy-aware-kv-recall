@@ -11,8 +11,19 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-BUDGET_RATIOS = (0.1, 0.2, 0.5)
-RECALL_KEYS = {0.1: "recall_10", 0.2: "recall_20", 0.5: "recall_50"}
+BUDGET_RATIOS = (0.05, 0.1, 0.2, 0.5)
+RECALL_KEYS = {
+    0.05: "recall_05",
+    0.1: "recall_10",
+    0.2: "recall_20",
+    0.5: "recall_50",
+}
+K_KEYS = {
+    0.05: "k_05",
+    0.1: "k_10",
+    0.2: "k_20",
+    0.5: "k_50",
+}
 
 
 def set_seed(seed: int) -> None:
@@ -26,6 +37,32 @@ def compute_entropy(logits: torch.Tensor) -> float:
     probs = log_probs.exp()
     entropy = -(probs * log_probs).sum(dim=-1)
     return float(entropy.item())
+
+
+def compute_attention_entropy(
+    attn_per_layer: torch.Tensor, valid_mask: torch.Tensor, epsilon: float = 1e-8
+) -> tuple[float, float]:
+    if valid_mask is None or int(valid_mask.sum().item()) == 0:
+        return float("nan"), float("nan")
+
+    valid_attn = attn_per_layer[:, valid_mask]
+    valid_attn = torch.clamp(valid_attn, min=0.0)
+    denom = valid_attn.sum(dim=-1, keepdim=True) + epsilon
+    probs = valid_attn / denom
+    entropies = -(probs * torch.log(probs + epsilon)).sum(dim=-1)
+    mean_entropy = entropies.mean()
+    std_entropy = entropies.std(unbiased=False)
+    return float(mean_entropy.item()), float(std_entropy.item())
+
+
+def compute_budget_sizes(valid_count: int, budget_ratios: tuple) -> dict:
+    if valid_count <= 0:
+        return {ratio: 0 for ratio in budget_ratios}
+    budgets = {}
+    for ratio in budget_ratios:
+        k = max(1, int(ratio * valid_count))
+        budgets[ratio] = min(k, valid_count)
+    return budgets
 
 
 def build_prompt(example: dict) -> str:
@@ -66,7 +103,7 @@ def extract_layerwise_attention(outputs) -> torch.Tensor:
                 f"Unexpected attention tensor rank={layer_attn.dim()} (expected 4)."
             )
 
-        # [batch, heads, q_len, kv_len] -> [kv_len] (sum over heads; q_len expected 1)
+        # [batch, heads, q_len, kv_len] -> [kv_len] (mean over heads; q_len expected 1)
         collapsed = layer_attn[0].mean(dim=0)
         if collapsed.size(0) != 1:
             raise RuntimeError(
@@ -295,6 +332,11 @@ def main() -> None:
                     entropy = compute_entropy(logits)
                     kv_len = int(attn_per_layer.size(1))
                     valid_mask = current_mask[0, :kv_len].bool()
+                    valid_count = int(valid_mask.sum().item())
+                    budget_sizes = compute_budget_sizes(valid_count, BUDGET_RATIOS)
+                    attn_entropy, attn_entropy_std = compute_attention_entropy(
+                        attn_per_layer, valid_mask
+                    )
 
                     recalls = compute_recalls(
                         attn_per_layer,
@@ -309,10 +351,12 @@ def main() -> None:
                         "sample_id": sample_idx,
                         "step": step,
                         "entropy": entropy,
-                        RECALL_KEYS[0.1]: recalls[0.1],
-                        RECALL_KEYS[0.2]: recalls[0.2],
-                        RECALL_KEYS[0.5]: recalls[0.5],
+                        "attn_entropy": attn_entropy,
+                        "attn_entropy_std": attn_entropy_std,
                     }
+                    for ratio in BUDGET_RATIOS:
+                        record[RECALL_KEYS[ratio]] = recalls[ratio]
+                        record[K_KEYS[ratio]] = budget_sizes[ratio]
                     log_file.write(json.dumps(record, ensure_ascii=True) + "\n")
                     if step % args.log_every == 0:
                         log_file.flush()

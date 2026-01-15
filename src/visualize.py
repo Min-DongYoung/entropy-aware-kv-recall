@@ -49,21 +49,25 @@ def main() -> None:
         raise ValueError("No step records found in the JSONL file.")
 
     recall_cols = [col for col in df.columns if col.startswith("recall_")]
+    if not recall_cols:
+        raise ValueError("No recall_* columns found in the JSONL file.")
     df = add_bins(df, args.bin_size, args.num_bins)
     grouped = df.groupby("entropy_bin", observed=True)[recall_cols].mean().reset_index()
     grouped["entropy_center"] = grouped["entropy_bin"].apply(lambda x: float(x.mid))
 
-    plot_df = grouped.melt(
+    line_plot_df = grouped.melt(
         id_vars=["entropy_center"],
         value_vars=recall_cols,
         var_name="budget",
         value_name="recall",
     )
-    plot_df["budget"] = plot_df["budget"].str.replace("recall_", "budget_", regex=False)
+    line_plot_df["budget"] = line_plot_df["budget"].str.replace(
+        "recall_", "budget_", regex=False
+    )
 
     sns.set_theme(style="whitegrid")
     plt.figure(figsize=(8, 5))
-    sns.lineplot(data=plot_df, x="entropy_center", y="recall", hue="budget", marker="o")
+    sns.lineplot(data=line_plot_df, x="entropy_center", y="recall", hue="budget", marker="o")
     plt.xlabel("Entropy (binned)")
     plt.ylabel("Mean Recall")
     plt.title("Binned Recall vs. Entropy")
@@ -72,6 +76,37 @@ def main() -> None:
     output_path = os.path.join(args.output_dir, "binned_recall_vs_entropy.png")
     plt.savefig(output_path, dpi=200)
     print(f"Saved plot to {output_path}")
+
+    boxen_df = df.melt(
+        id_vars=["entropy_bin"],
+        value_vars=recall_cols,
+        var_name="budget",
+        value_name="recall",
+    )
+    boxen_df["budget"] = boxen_df["budget"].str.replace("recall_", "budget_", regex=False)
+    boxen_df["entropy_bin_label"] = boxen_df["entropy_bin"].astype(str)
+    if hasattr(df["entropy_bin"].dtype, "categories"):
+        bin_order = [str(cat) for cat in df["entropy_bin"].cat.categories]
+    else:
+        bin_order = [str(cat) for cat in sorted(df["entropy_bin"].unique(), key=lambda x: x.mid)]
+
+    plt.figure(figsize=(10, 5))
+    sns.boxenplot(
+        data=boxen_df,
+        x="entropy_bin_label",
+        y="recall",
+        hue="budget",
+        order=bin_order,
+    )
+    plt.xlabel("Entropy (binned)")
+    plt.ylabel("Recall")
+    plt.title("Binned Recall vs. Entropy (Boxen)")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+
+    boxen_path = os.path.join(args.output_dir, "binned_recall_vs_entropy_boxen.png")
+    plt.savefig(boxen_path, dpi=200)
+    print(f"Saved plot to {boxen_path}")
 
 
 if __name__ == "__main__":
