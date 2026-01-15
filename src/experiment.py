@@ -62,6 +62,7 @@ def compute_recalls(
     accum_scores: torch.Tensor,
     valid_mask: torch.Tensor,
     budget_ratios: tuple,
+    window_size: int,
 ) -> dict:
     valid_count = int(valid_mask.sum().item())
     recalls = {}
@@ -79,7 +80,19 @@ def compute_recalls(
         k = max(1, int(ratio * valid_count))
         k = min(k, valid_count)
         gold_idx = torch.topk(scores_gold, k, dim=-1).indices
-        pred_idx = torch.topk(scores_pred, k, dim=-1).indices
+        cutoff_idx = max(0, valid_count - window_size)
+        window_indices = torch.arange(cutoff_idx, valid_count, device=attn_vec.device)
+        remaining_k = k - int(window_indices.numel())
+
+        if remaining_k > 0:
+            hist_scores = scores_pred[:cutoff_idx]
+            if hist_scores.numel() > 0:
+                hh_indices = torch.topk(hist_scores, remaining_k, dim=-1).indices
+                pred_idx = torch.cat([hh_indices, window_indices], dim=0)
+            else:
+                pred_idx = window_indices
+        else:
+            pred_idx = window_indices[-k:]
         hits = torch.isin(pred_idx, gold_idx).sum().item()
         recalls[ratio] = hits / k
     return recalls
@@ -120,6 +133,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--no_stop_on_eos", action="store_true")
+    parser.add_argument("--window_size", type=int, default=32)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -151,6 +165,7 @@ def main() -> None:
         "max_seq_len": args.max_seq_len,
         "attn_implementation": "flash_attention_2",
         "flash_attn_version": get_flash_attn_version(),
+        "window_size": args.window_size,
     }
 
     device = torch.device("cuda")
@@ -206,7 +221,13 @@ def main() -> None:
                     entropy = compute_entropy(logits)
                     kv_len = attn_vec.size(0)
                     valid_mask = current_mask[0, :kv_len].bool()
-                    recalls = compute_recalls(attn_vec, accum_scores, valid_mask, BUDGET_RATIOS)
+                    recalls = compute_recalls(
+                        attn_vec,
+                        accum_scores,
+                        valid_mask,
+                        BUDGET_RATIOS,
+                        args.window_size,
+                    )
 
                     record = {
                         "type": "step",
