@@ -11,7 +11,6 @@ datasets>=2.16.0,<3.0.0
 huggingface_hub
 
 # Optimization
-flash-attn>=2.5.0
 einops
 
 # Data Analysis & Visualization

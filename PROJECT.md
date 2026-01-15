@@ -16,7 +16,7 @@
 ### 3.1. Infrastructure
 * **Environment:** Google Colab Pro+ (Single Node)
 * **GPU:** NVIDIA A100-SXM4-40GB (Required for full context simulation)
-* **Model:** `Qwen/Qwen2.5-7B-Instruct` (Flash Attention 2 enabled)
+* **Model:** `Qwen/Qwen2.5-7B-Instruct` (PyTorch eager attention; attention maps enabled)
 
 ### 3.2. Dataset
 * **Benchmark:** **LongBench** (Reasoning Subset)

@@ -6,7 +6,7 @@ This project observes the correlation between High Token Entropy and KV Cache Re
 ```bash
 pip install -r requirements.txt
 ```
-Designed for NVIDIA A100 (40GB) with Flash Attention 2.
+Designed for NVIDIA A100 (40GB). This repo uses PyTorch eager attention to enable attention map extraction (`output_attentions=True`).
 
 ## Usage Guide
 Run the experiment:

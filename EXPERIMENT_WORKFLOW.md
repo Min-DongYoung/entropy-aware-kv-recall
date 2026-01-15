@@ -35,7 +35,7 @@ Validate the hypothesis that **High Token Entropy** during reasoning serves as a
 
 ### 2.2 Software Stack
 - **Framework:** PyTorch (`torch>=2.1.2`), Hugging Face Transformers.
-- **Optimization:** **Flash Attention 2** (`flash-attn>=2.5.0`) is mandatory for memory efficiency.
+- **Attention Backend:** PyTorch eager attention is used to enable extracting attention maps (`output_attentions=True`). (Flash Attention variants typically do not support returning attentions in Transformers.)
 - **Precision:** `torch.bfloat16` (Preferred) or `torch.float16`.
 
 ### 2.3 Model & Data
@@ -164,5 +164,5 @@ Each execution log (JSONL metadata) must include:
 - Model Name & Path
 - Dataset & Split
 - Max Sequence Length
-- Flash Attention Version
+- Attention Implementation (`attn_implementation`) and backend/version (if available)
 - Timestamp
