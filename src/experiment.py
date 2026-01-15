@@ -1,4 +1,3 @@
-%%writefile src/experiment.py
 import argparse
 import json
 import os
