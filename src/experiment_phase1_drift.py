@@ -369,7 +369,7 @@ def main() -> None:
         default="Qwen/Qwen3-8B-Thinking",
         choices=[
             "Qwen/Qwen3-8B-Thinking",
-            "deepseek-ai/DeepSeek-R1-Distill-Qwen-8B",
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         ],
     )
     parser.add_argument("--output_dir", type=str, required=True)
