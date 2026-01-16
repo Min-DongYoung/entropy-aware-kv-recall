@@ -231,6 +231,82 @@ def pick_primary_recall(recall_cols: list) -> str:
     return sorted(recall_cols, key=key_fn)[0]
 
 
+def _safe_corr(series_a: pd.Series, series_b: pd.Series, method: str) -> float:
+    df_pair = pd.concat([series_a, series_b], axis=1).dropna()
+    if df_pair.shape[0] < 2:
+        return np.nan
+    return float(df_pair.iloc[:, 0].corr(df_pair.iloc[:, 1], method=method))
+
+
+def compute_time_lag_summary(df: pd.DataFrame) -> dict:
+    required_cols = {"sample_id", "entropy", "attn_entropy"}
+    if not required_cols.issubset(df.columns):
+        missing = sorted(required_cols - set(df.columns))
+        warnings.warn(
+            f"Skipping time-lag analysis; missing columns: {', '.join(missing)}",
+            RuntimeWarning,
+        )
+        return {"skipped": True, "missing_columns": missing}
+
+    lag_df = df.copy()
+    lag_df["next_attn_entropy"] = (
+        lag_df.groupby("sample_id", observed=True)["attn_entropy"].shift(-1)
+    )
+    lag_df["next_token_entropy"] = (
+        lag_df.groupby("sample_id", observed=True)["entropy"].shift(-1)
+    )
+
+    lag_df = lag_df.dropna(subset=["next_attn_entropy", "next_token_entropy", "entropy", "attn_entropy"])
+
+    concurrent_pearson = _safe_corr(lag_df["entropy"], lag_df["attn_entropy"], "pearson")
+    concurrent_spearman = _safe_corr(lag_df["entropy"], lag_df["attn_entropy"], "spearman")
+    forward_pearson = _safe_corr(lag_df["entropy"], lag_df["next_attn_entropy"], "pearson")
+    forward_spearman = _safe_corr(lag_df["entropy"], lag_df["next_attn_entropy"], "spearman")
+    backward_pearson = _safe_corr(lag_df["attn_entropy"], lag_df["next_token_entropy"], "pearson")
+    backward_spearman = _safe_corr(lag_df["attn_entropy"], lag_df["next_token_entropy"], "spearman")
+
+    high_thresh = float(lag_df["entropy"].quantile(0.9)) if not lag_df.empty else np.nan
+    low_thresh = float(lag_df["entropy"].quantile(0.1)) if not lag_df.empty else np.nan
+    high_mean = (
+        float(lag_df.loc[lag_df["entropy"] > high_thresh, "next_attn_entropy"].mean())
+        if np.isfinite(high_thresh)
+        else np.nan
+    )
+    low_mean = (
+        float(lag_df.loc[lag_df["entropy"] < low_thresh, "next_attn_entropy"].mean())
+        if np.isfinite(low_thresh)
+        else np.nan
+    )
+
+    return {
+        "skipped": False,
+        "counts": {
+            "rows_total": int(df.shape[0]),
+            "rows_used": int(lag_df.shape[0]),
+        },
+        "correlations": {
+            "concurrent": {
+                "pearson": concurrent_pearson,
+                "spearman": concurrent_spearman,
+            },
+            "forward": {
+                "pearson": forward_pearson,
+                "spearman": forward_spearman,
+            },
+            "backward": {
+                "pearson": backward_pearson,
+                "spearman": backward_spearman,
+            },
+        },
+        "conditional_next_attn_entropy": {
+            "high_entropy_threshold": high_thresh,
+            "low_entropy_threshold": low_thresh,
+            "mean_next_attn_entropy_high": high_mean,
+            "mean_next_attn_entropy_low": low_mean,
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze JSONL logs from experiment.py.")
     parser.add_argument("--input_path", type=str, required=True)
@@ -291,6 +367,11 @@ def main() -> None:
     exemplars_path = os.path.join(args.output_dir, "exemplars.csv")
     exemplars[exemplar_cols].to_csv(exemplars_path, index=False)
 
+    time_lag_summary = compute_time_lag_summary(df)
+    time_lag_path = os.path.join(args.output_dir, "time_lag_summary.json")
+    with open(time_lag_path, "w", encoding="utf-8") as handle:
+        json.dump(time_lag_summary, handle, indent=2)
+
     print("Analysis complete.")
     print(f"Records: {len(df)}")
     print(f"Samples: {df['sample_id'].nunique()}")
@@ -302,6 +383,31 @@ def main() -> None:
         print(f"Sample summary: {sample_path}")
     print(f"Trend summary: {trend_path}")
     print(f"Exemplars: {exemplars_path}")
+    print(f"Time-lag summary: {time_lag_path}")
+    if not time_lag_summary.get("skipped"):
+        corr = time_lag_summary["correlations"]
+        cond = time_lag_summary["conditional_next_attn_entropy"]
+        print("Time-lag correlations:")
+        print(
+            "  concurrent (entropy vs attn_entropy): "
+            f"pearson={corr['concurrent']['pearson']:.4f}, "
+            f"spearman={corr['concurrent']['spearman']:.4f}"
+        )
+        print(
+            "  forward (entropy -> next_attn_entropy): "
+            f"pearson={corr['forward']['pearson']:.4f}, "
+            f"spearman={corr['forward']['spearman']:.4f}"
+        )
+        print(
+            "  backward (attn_entropy -> next_token_entropy): "
+            f"pearson={corr['backward']['pearson']:.4f}, "
+            f"spearman={corr['backward']['spearman']:.4f}"
+        )
+        print(
+            "Next attn_entropy conditioned on entropy(t): "
+            f"high>{cond['high_entropy_threshold']:.4f} mean={cond['mean_next_attn_entropy_high']:.4f}, "
+            f"low<{cond['low_entropy_threshold']:.4f} mean={cond['mean_next_attn_entropy_low']:.4f}"
+        )
 
 
 if __name__ == "__main__":

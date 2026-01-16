@@ -4,11 +4,13 @@ torchvision
 torchaudio
 
 # Hugging Face Ecosystem
-transformers>=4.37.0
+transformers>=4.45.0
 accelerate>=0.26.0
 # NOTE: LongBench (`THUDM/LongBench`) is a script-based dataset repo; `datasets>=3` dropped support for dataset scripts.
 datasets>=2.16.0,<3.0.0
 huggingface_hub
+sentencepiece
+protobuf
 
 # Optimization
 einops
